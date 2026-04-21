@@ -3,6 +3,9 @@ import pandas as pd
 import plotly.express as px
 import sys
 import os
+import PyPDF2
+import io
+import json
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import get_connection
@@ -17,7 +20,7 @@ st.sidebar.title("Career Signal")
 st.sidebar.markdown("---")
 page = st.sidebar.radio(
     "Navigate",
-    ["Market Overview", "Skills by Role", "Cloud Platforms", "Experience & Salary"]
+    ["Market Overview", "Skills by Role", "Cloud Platforms", "Experience & Salary", "Resume Analysis"]
 )
 
 if page == "Market Overview":
@@ -179,3 +182,100 @@ elif page == "Experience & Salary":
         color_discrete_map={"Yes": "green", "No": "red"}
     )
     st.plotly_chart(fig2, use_container_width=True)
+
+elif page == "Resume Analysis":
+    st.title("Resume Analysis")
+    st.markdown("Upload your resume and get personalized insights")
+    
+    target_role = st.selectbox(
+        "What role are you targeting?",
+        ["data engineer", "data scientist", "data analyst"]
+    )
+    
+    uploaded_file = st.file_uploader("Upload your resume (PDF)", type="pdf")
+    
+    if uploaded_file is not None:
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+        resume_text = ""
+        for page_num in range(len(pdf_reader.pages)):
+            resume_text += pdf_reader.pages[page_num].extract_text()
+        
+        st.success("Resume uploaded successfully!")
+        
+        with st.expander("See extracted text"):
+            st.write(resume_text)
+
+        if st.button("Analyze My Resume"):
+            with st.spinner("Analyzing your resume..."):
+                from groq import Groq
+                
+                groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+                
+                resume_prompt = f"""
+                Extract skills from this resume and return ONLY a JSON object:
+                - technical_skills: list of technical skills
+                - cloud_platforms: list of cloud platforms
+                - experience_years: total years of experience as a number
+                - experience_level: one of "entry", "mid", "senior"
+                - education: highest education level
+                
+                Resume:
+                {resume_text}
+                
+                Return ONLY valid JSON. No explanation.
+                """
+                
+                response = groq_client.chat.completions.create(
+                    messages=[{"role": "user", "content": resume_prompt}],
+                    model="llama-3.3-70b-versatile",
+                    temperature=0
+                )
+                
+                response_text = response.choices[0].message.content.strip()
+                if response_text.startswith("```"):
+                    response_text = response_text.split("```")[1]
+                    if response_text.startswith("json"):
+                        response_text = response_text[4:]
+                resume_skills = json.loads(response_text)
+                
+                st.subheader("Your Skills Profile")
+                st.json(resume_skills)
+                
+                st.subheader("Gap Analysis")
+                st.markdown(f"Comparing your skills against market demand for **{target_role}**")
+                
+                conn = get_connection()
+                df_market = pd.read_sql("""
+                    SELECT skill, COUNT(*) as demand_count
+                    FROM (
+                        SELECT js.job_id, j.role, json_array_elements_text(js.technical_skills::json) as skill
+                        FROM job_skills js
+                        JOIN jobs j ON js.job_id = j.job_id
+                        WHERE j.role = %(role)s
+                    ) skills
+                    GROUP BY skill
+                    ORDER BY demand_count DESC
+                    LIMIT 20
+                """, conn, params={"role": target_role})
+                conn.close()
+                
+                user_skills = [s.lower() for s in resume_skills.get("technical_skills", [])]
+                market_skills = df_market["skill"].str.lower().tolist()
+                
+                missing_skills = [s for s in market_skills if s not in user_skills]
+                matching_skills = [s for s in market_skills if s in user_skills]
+                
+                match_percentage = round(len(matching_skills) / len(market_skills) * 100)
+                
+                st.metric("Resume Match Score", f"{match_percentage}%")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.success(f"Skills you have ({len(matching_skills)})")
+                    for skill in matching_skills:
+                        st.write(f"✅ {skill}")
+                
+                with col2:
+                    st.error(f"Skills to add ({len(missing_skills)})")
+                    for skill in missing_skills:
+                        st.write(f"❌ {skill}")
